@@ -68,14 +68,19 @@ class VoiceCallApp {
         });
 
         this.socket.on('existing-participants', async (participants) => {
+            // As the new joiner, we always initiate connections to existing participants
             for (const participant of participants) {
                 await this.createPeerConnection(participant.userId, participant.username);
                 this.addParticipant(participant);
                 
-                // As the new joiner, we initiate connections to existing participants
                 const peer = this.peers.get(participant.userId);
                 peer.isOfferer = true;
-                await this.sendOffer(participant.userId);
+                
+                // Stagger the offers to avoid simultaneous attempts
+                const delay = participants.indexOf(participant) * 200;
+                setTimeout(() => {
+                    this.sendOffer(participant.userId);
+                }, delay);
             }
         });
 
@@ -259,13 +264,24 @@ class VoiceCallApp {
         this.logMessage(`${participant.username} joined the call${participant.isAdmin ? ' (Admin)' : ''}`, 'info');
         this.addParticipant(participant);
 
-        // Only create connection if we're already in the call and we're the "offerer"
-        // Use socket ID comparison to determine who initiates
-        if (this.isInCall && this.localStream && this.socket.id < participant.userId) {
+        // Only create connection if we're already in the call
+        // Use deterministic logic: lower socket ID always initiates
+        if (this.isInCall && this.localStream) {
             await this.createPeerConnection(participant.userId, participant.username);
-            const peer = this.peers.get(participant.userId);
-            peer.isOfferer = true;
-            await this.sendOffer(participant.userId);
+            
+            if (this.socket.id < participant.userId) {
+                // We initiate the connection
+                const peer = this.peers.get(participant.userId);
+                peer.isOfferer = true;
+                
+                // Add small delay to avoid race conditions
+                setTimeout(() => {
+                    this.sendOffer(participant.userId);
+                }, 100);
+            } else {
+                // They will initiate, we just wait
+                this.logMessage(`Waiting for ${participant.username} to initiate connection`, 'info');
+            }
         }
     }
 
@@ -295,9 +311,20 @@ class VoiceCallApp {
         // Handle connection state changes
         peerConnection.onconnectionstatechange = () => {
             this.logMessage(`Connection with ${username}: ${peerConnection.connectionState}`, 'info');
+            
             if (peerConnection.connectionState === 'failed') {
                 this.logMessage(`Connection failed with ${username}, attempting restart`, 'error');
-                // Could implement reconnection logic here
+                setTimeout(() => {
+                    this.attemptReconnection(userId, username);
+                }, 1000);
+            } else if (peerConnection.connectionState === 'disconnected') {
+                this.logMessage(`Connection disconnected with ${username}`, 'info');
+                // Give it some time to reconnect automatically
+                setTimeout(() => {
+                    if (peerConnection.connectionState === 'disconnected') {
+                        this.attemptReconnection(userId, username);
+                    }
+                }, 5000);
             }
         };
 
@@ -343,8 +370,23 @@ class VoiceCallApp {
         const peer = this.peers.get(senderId);
         
         try {
-            // Only set remote description if we're in the correct state
-            if (peer.connection.signalingState === 'stable' || peer.connection.signalingState === 'have-remote-offer') {
+            // If we're in have-local-offer state, we need to handle collision
+            if (peer.connection.signalingState === 'have-local-offer') {
+                // Use socket ID to determine who should back down
+                if (this.socket.id > senderId) {
+                    // We back down - restart our connection
+                    this.logMessage(`Offer collision with ${senderUsername} - restarting connection`, 'info');
+                    await this.restartPeerConnection(senderId, senderUsername);
+                    return;
+                } else {
+                    // They should back down, ignore their offer
+                    this.logMessage(`Offer collision with ${senderUsername} - ignoring their offer`, 'info');
+                    return;
+                }
+            }
+            
+            // Normal offer handling
+            if (peer.connection.signalingState === 'stable') {
                 await peer.connection.setRemoteDescription(offer);
                 
                 // Process any queued ICE candidates
@@ -365,11 +407,28 @@ class VoiceCallApp {
                     answer: answer
                 });
             } else {
-                this.logMessage(`Cannot handle offer from ${senderUsername} - wrong signaling state: ${peer.connection.signalingState}`, 'error');
+                this.logMessage(`Cannot handle offer from ${senderUsername} - signaling state: ${peer.connection.signalingState}`, 'error');
             }
         } catch (error) {
             this.logMessage(`Error handling offer from ${senderUsername}: ${error.message}`, 'error');
         }
+    }
+
+    async restartPeerConnection(userId, username) {
+        // Close existing connection
+        const existingPeer = this.peers.get(userId);
+        if (existingPeer) {
+            existingPeer.connection.close();
+        }
+        
+        // Create new connection
+        await this.createPeerConnection(userId, username);
+        
+        // Wait a bit to avoid immediate collision
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // Don't send offer - wait for them to send one
+        this.logMessage(`Restarted connection with ${username} - waiting for their offer`, 'info');
     }
 
     async handleWebRTCAnswer(data) {
@@ -427,6 +486,30 @@ class VoiceCallApp {
             this.setupAudioChannelSeparation(userId, username, stream);
         } else {
             this.playRemoteAudio(userId, username, stream);
+        }
+    }
+
+    async attemptReconnection(userId, username) {
+        this.logMessage(`Attempting to reconnect to ${username}`, 'info');
+        
+        // Close and remove existing connection
+        if (this.peers.has(userId)) {
+            const peer = this.peers.get(userId);
+            peer.connection.close();
+            this.peers.delete(userId);
+        }
+        
+        // Create new connection
+        await this.createPeerConnection(userId, username);
+        
+        // Use same logic as initial connection
+        if (this.socket.id < userId) {
+            const peer = this.peers.get(userId);
+            peer.isOfferer = true;
+            
+            setTimeout(() => {
+                this.sendOffer(userId);
+            }, 500);
         }
     }
 

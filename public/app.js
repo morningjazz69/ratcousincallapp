@@ -236,7 +236,12 @@ class VoiceCallApp {
             // Get available audio output devices
             await this.populateOutputDevices();
             
+            // Create a master gain node for final output
+            this.masterGain = this.audioContext.createGain();
+            this.masterGain.connect(this.audioContext.destination);
+            
             this.logMessage('Web Audio API initialized for channel separation', 'success');
+            this.logMessage('Note: For true multi-channel output to Loopback, select your Loopback device as system output', 'info');
         } catch (error) {
             this.logMessage(`Error initializing Web Audio API: ${error.message}`, 'error');
         }
@@ -525,37 +530,48 @@ class VoiceCallApp {
             const source = this.audioContext.createMediaStreamSource(stream);
             const gainNode = this.audioContext.createGain();
             
-            // For multi-channel output (like 16-channel Loopback)
-            const channelSplitter = this.audioContext.createChannelSplitter(16);
+            // Create channel merger for discrete channel routing
             const channelMerger = this.audioContext.createChannelMerger(16);
             
-            // Assign this user to a specific discrete channel (0-15)
-            const discreteChannel = this.channelIndex % 16;
+            // Start with stereo panning for now (fallback if multi-channel doesn't work)
+            const pannerNode = this.audioContext.createStereoPanner();
             
-            // Connect to discrete channel
+            // Assign initial channel (will be adjustable via UI)
+            const assignedChannel = this.channelIndex % 16;
+            
+            // Connect for both stereo panning AND discrete channel routing
             source.connect(gainNode);
-            gainNode.connect(channelSplitter);
             
-            // Route to specific output channel
-            channelSplitter.connect(channelMerger, 0, discreteChannel);
-            channelMerger.connect(this.audioContext.destination);
+            // Stereo panning connection (always works)
+            gainNode.connect(pannerNode);
+            pannerNode.connect(this.masterGain);
+            
+            // Try discrete channel routing (may not work in all browsers/setups)
+            try {
+                // Connect to specific channel of the merger
+                gainNode.connect(channelMerger, 0, assignedChannel);
+                channelMerger.connect(this.audioContext.destination);
+            } catch (channelError) {
+                this.logMessage(`Discrete channel routing not available, using stereo panning`, 'info');
+            }
             
             // Store channel info
             this.audioChannels.set(userId, {
                 audio: audio,
                 source: source,
                 gainNode: gainNode,
-                channelSplitter: channelSplitter,
+                pannerNode: pannerNode,
                 channelMerger: channelMerger,
                 username: username,
                 channelIndex: this.channelIndex,
-                discreteChannel: discreteChannel
+                assignedChannel: assignedChannel,
+                isMuted: false
             });
             
-            this.createChannelControlUI(userId, username, this.channelIndex, discreteChannel);
+            this.createChannelControlUI(userId, username, this.channelIndex, assignedChannel);
             this.channelIndex++;
             
-            this.logMessage(`${username} assigned to discrete channel ${discreteChannel + 1}`, 'info');
+            this.logMessage(`${username} assigned to channel ${assignedChannel + 1} (pan: ${this.calculatePanPosition(assignedChannel)})`, 'info');
             
         } catch (error) {
             this.logMessage(`Error setting up channel separation for ${username}: ${error.message}`, 'error');
@@ -564,24 +580,35 @@ class VoiceCallApp {
         }
     }
 
-    createChannelControlUI(userId, username, channelIndex, discreteChannel) {
+    calculatePanPosition(channelIndex) {
+        // Spread channels across stereo field
+        return Math.min(1, Math.max(-1, (channelIndex / 8) - 1));
+    }
+
+    createChannelControlUI(userId, username, channelIndex, assignedChannel) {
         const channelDiv = document.createElement('div');
         channelDiv.className = 'audio-channel';
         channelDiv.id = `channel-${userId}`;
         
         channelDiv.innerHTML = `
             <div class="channel-info">
-                <div class="channel-name">Ch ${discreteChannel + 1}: ${username}</div>
-                <div class="channel-status">Discrete Channel ${discreteChannel + 1} | Active</div>
+                <div class="channel-name">${username}</div>
+                <div class="channel-status">Channel ${assignedChannel + 1} | Pan: ${this.calculatePanPosition(assignedChannel).toFixed(2)}</div>
             </div>
             <div class="channel-controls">
+                <label>Channel:</label>
+                <select class="channel-select" id="channel-${userId}-select" title="Output Channel">
+                    ${this.generateChannelOptions(assignedChannel)}
+                </select>
+                <label>Volume:</label>
                 <input type="range" class="volume-control" min="0" max="2" step="0.1" value="1" 
                        id="volume-${userId}" title="Volume (0-200%)">
+                <label>Pan:</label>
+                <input type="range" class="pan-control" min="-1" max="1" step="0.1" 
+                       value="${this.calculatePanPosition(assignedChannel)}" 
+                       id="pan-${userId}" title="Stereo Pan">
                 <button class="mute-channel-btn" id="mute-${userId}">🔊</button>
                 <button class="solo-channel-btn" id="solo-${userId}">Solo</button>
-                <select class="channel-select" id="channel-${userId}-select" title="Output Channel">
-                    ${this.generateChannelOptions(discreteChannel)}
-                </select>
             </div>
         `;
         
@@ -590,6 +617,10 @@ class VoiceCallApp {
         // Add event listeners
         document.getElementById(`volume-${userId}`).addEventListener('input', (e) => {
             this.updateChannelVolume(userId, e.target.value);
+        });
+        
+        document.getElementById(`pan-${userId}`).addEventListener('input', (e) => {
+            this.updateChannelPan(userId, e.target.value);
         });
         
         document.getElementById(`mute-${userId}`).addEventListener('click', () => {
@@ -618,24 +649,35 @@ class VoiceCallApp {
         const channel = this.audioChannels.get(userId);
         if (channel && channel.source) {
             try {
+                // Update the assigned channel
+                channel.assignedChannel = newChannel;
+                
                 // Disconnect old routing
-                channel.gainNode.disconnect();
-                
-                // Create new routing to different channel
-                const newChannelMerger = this.audioContext.createChannelMerger(16);
-                channel.channelSplitter.connect(newChannelMerger, 0, newChannel);
-                newChannelMerger.connect(this.audioContext.destination);
-                
-                // Update stored info
-                channel.channelMerger = newChannelMerger;
-                channel.discreteChannel = newChannel;
-                
-                // Update UI
-                const statusElement = document.querySelector(`#channel-${userId} .channel-status`);
-                if (statusElement) {
-                    statusElement.textContent = `Discrete Channel ${newChannel + 1} | Active`;
+                if (channel.channelMerger) {
+                    channel.gainNode.disconnect(channel.channelMerger);
                 }
                 
+                // Update pan position for stereo representation
+                const newPanPosition = this.calculatePanPosition(newChannel);
+                channel.pannerNode.pan.setValueAtTime(newPanPosition, this.audioContext.currentTime);
+                
+                // Update pan slider
+                const panSlider = document.getElementById(`pan-${userId}`);
+                if (panSlider) {
+                    panSlider.value = newPanPosition;
+                }
+                
+                // Try to create new discrete channel routing
+                try {
+                    const newChannelMerger = this.audioContext.createChannelMerger(16);
+                    channel.gainNode.connect(newChannelMerger, 0, newChannel);
+                    newChannelMerger.connect(this.audioContext.destination);
+                    channel.channelMerger = newChannelMerger;
+                } catch (error) {
+                    this.logMessage(`Discrete channel routing not available, using pan position`, 'info');
+                }
+                
+                this.updateChannelStatus(userId);
                 this.logMessage(`${channel.username} moved to channel ${newChannel + 1}`, 'info');
                 
             } catch (error) {
@@ -644,16 +686,68 @@ class VoiceCallApp {
         }
     }
 
+    toggleChannelSolo(userId) {
+        const channel = this.audioChannels.get(userId);
+        if (!channel) return;
+        
+        const soloButton = document.getElementById(`solo-${userId}`);
+        const isCurrentlySolo = soloButton.classList.contains('active');
+        
+        if (isCurrentlySolo) {
+            // Un-solo: restore all channels
+            this.audioChannels.forEach((ch, id) => {
+                if (!ch.isMuted) {
+                    ch.gainNode.gain.setValueAtTime(ch.originalVolume || 1, this.audioContext.currentTime);
+                }
+                const btn = document.getElementById(`solo-${id}`);
+                if (btn) btn.classList.remove('active');
+            });
+        } else {
+            // Solo this channel: mute all others
+            this.audioChannels.forEach((ch, id) => {
+                if (id === userId) {
+                    // This is the solo channel - ensure it's audible
+                    if (!ch.isMuted) {
+                        ch.gainNode.gain.setValueAtTime(ch.originalVolume || 1, this.audioContext.currentTime);
+                    }
+                    soloButton.classList.add('active');
+                    soloButton.style.background = '#f59e0b';
+                } else {
+                    // Mute other channels
+                    ch.originalVolume = ch.gainNode.gain.value;
+                    ch.gainNode.gain.setValueAtTime(0, this.audioContext.currentTime);
+                    const btn = document.getElementById(`solo-${id}`);
+                    if (btn) btn.classList.remove('active');
+                }
+            });
+        }
+    }
+
     updateChannelVolume(userId, volume) {
         const channel = this.audioChannels.get(userId);
         if (channel && channel.gainNode) {
             channel.gainNode.gain.setValueAtTime(parseFloat(volume), this.audioContext.currentTime);
-            
-            // Update status
+            this.updateChannelStatus(userId);
+        }
+    }
+
+    updateChannelPan(userId, panValue) {
+        const channel = this.audioChannels.get(userId);
+        if (channel && channel.pannerNode) {
+            channel.pannerNode.pan.setValueAtTime(parseFloat(panValue), this.audioContext.currentTime);
+            this.updateChannelStatus(userId);
+        }
+    }
+
+    updateChannelStatus(userId) {
+        const channel = this.audioChannels.get(userId);
+        if (channel) {
             const statusElement = document.querySelector(`#channel-${userId} .channel-status`);
             if (statusElement) {
-                const discreteChannel = channel.discreteChannel;
-                statusElement.textContent = `Discrete Channel ${discreteChannel + 1} | Volume: ${(volume * 100).toFixed(0)}%`;
+                const volume = channel.gainNode.gain.value;
+                const pan = channel.pannerNode.pan.value;
+                const channelNum = channel.assignedChannel + 1;
+                statusElement.textContent = `Channel ${channelNum} | Vol: ${(volume * 100).toFixed(0)}% | Pan: ${pan.toFixed(2)}`;
             }
         }
     }
@@ -663,24 +757,29 @@ class VoiceCallApp {
         const muteButton = document.getElementById(`mute-${userId}`);
         
         if (channel && channel.gainNode && muteButton) {
-            const currentVolume = channel.gainNode.gain.value;
-            if (currentVolume > 0) {
-                channel.previousVolume = currentVolume;
-                channel.gainNode.gain.setValueAtTime(0, this.audioContext.currentTime);
-                muteButton.textContent = '🔇';
-                muteButton.style.background = '#f56565';
-            } else {
-                const restoreVolume = channel.previousVolume || 1;
+            if (channel.isMuted) {
+                // Unmute
+                const restoreVolume = channel.originalVolume || 1;
                 channel.gainNode.gain.setValueAtTime(restoreVolume, this.audioContext.currentTime);
-                muteButton.textContent = '🔊';
+                muteButton.textContent = '�';
                 muteButton.style.background = '#48bb78';
+                channel.isMuted = false;
                 
                 // Update volume slider
                 const volumeSlider = document.getElementById(`volume-${userId}`);
                 if (volumeSlider) {
                     volumeSlider.value = restoreVolume;
                 }
+            } else {
+                // Mute
+                channel.originalVolume = channel.gainNode.gain.value;
+                channel.gainNode.gain.setValueAtTime(0, this.audioContext.currentTime);
+                muteButton.textContent = '�';
+                muteButton.style.background = '#f56565';
+                channel.isMuted = true;
             }
+            
+            this.updateChannelStatus(userId);
         }
     }
 

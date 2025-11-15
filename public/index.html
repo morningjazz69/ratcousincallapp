@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Call App</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Voice Call App</h1>
+            <div class="connection-status">
+                <span id="connectionStatus">Disconnected</span>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="user-info">
+                <input type="text" id="usernameInput" placeholder="Enter your name" maxlength="20">
+                <input type="password" id="passwordInput" placeholder="Call password" maxlength="50">
+                <button id="joinButton">Join Call</button>
+                <input type="password" id="adminPasswordInput" placeholder="Admin code" maxlength="50" style="display: none;">
+                <button id="adminButton">Admin Mode</button>
+            </div>
+
+            <div class="call-controls" id="callControls" style="display: none;">
+                <button id="muteButton" class="control-btn">🎤 Mute</button>
+                <button id="leaveButton" class="control-btn leave">📞 Leave Call</button>
+            </div>
+
+            <div class="participants" id="participants">
+                <h3>Participants:</h3>
+                <ul id="participantsList"></ul>
+            </div>
+
+            <div class="admin-panel" id="adminPanel" style="display: none;">
+                <h3>Admin Controls - Channel Separation</h3>
+                <div id="audioChannels"></div>
+                <div class="admin-controls">
+                    <button id="muteAllButton">Mute All</button>
+                    <button id="unmuteAllButton">Unmute All</button>
+                    <select id="outputDeviceSelect">
+                        <option value="">Select Output Device</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-log">
+            <h4>Status Log:</h4>
+            <div id="statusLog"></div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

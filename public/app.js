@@ -236,14 +236,28 @@ class VoiceCallApp {
             // Get available audio output devices
             await this.populateOutputDevices();
             
-            // Create a master gain node for final output
-            this.masterGain = this.audioContext.createGain();
-            this.masterGain.connect(this.audioContext.destination);
+            // Create destination for UnityInput routing
+            this.unityDestination = null;
+            this.setupUnityInputRouting();
             
-            this.logMessage('Web Audio API initialized for channel separation', 'success');
-            this.logMessage('Note: For true multi-channel output to Loopback, select your Loopback device as system output', 'info');
+            this.logMessage('Web Audio API initialized for UnityInput channel separation', 'success');
         } catch (error) {
             this.logMessage(`Error initializing Web Audio API: ${error.message}`, 'error');
+        }
+    }
+
+    async setupUnityInputRouting() {
+        try {
+            // Create MediaStreamDestination to capture processed audio
+            this.mediaStreamDestination = this.audioContext.createMediaStreamDestination();
+            
+            // Create channel merger for precise channel control
+            this.channelMerger = this.audioContext.createChannelMerger(16);
+            this.channelMerger.connect(this.mediaStreamDestination);
+            
+            this.logMessage('UnityInput routing prepared - select UnityInput as output device', 'info');
+        } catch (error) {
+            this.logMessage(`Error setting up UnityInput routing: ${error.message}`, 'error');
         }
     }
 
@@ -252,14 +266,27 @@ class VoiceCallApp {
             const devices = await navigator.mediaDevices.enumerateDevices();
             const audioOutputs = devices.filter(device => device.kind === 'audiooutput');
             
-            this.outputDeviceSelect.innerHTML = '<option value="">Default Output</option>';
+            this.outputDeviceSelect.innerHTML = '<option value="">Select Output Device</option>';
             
             audioOutputs.forEach(device => {
                 const option = document.createElement('option');
                 option.value = device.deviceId;
                 option.textContent = device.label || `Audio Output ${device.deviceId.substr(0, 8)}`;
+                
+                // Auto-select UnityInput if found
+                if (device.label && device.label.toLowerCase().includes('unity')) {
+                    option.selected = true;
+                    this.logMessage(`Auto-selected UnityInput device: ${device.label}`, 'success');
+                }
+                
                 this.outputDeviceSelect.appendChild(option);
             });
+            
+            // Set up output device change handler
+            this.outputDeviceSelect.addEventListener('change', () => {
+                this.updateUnityInputOutput();
+            });
+            
         } catch (error) {
             this.logMessage(`Error getting audio devices: ${error.message}`, 'error');
         }
@@ -524,44 +551,24 @@ class VoiceCallApp {
             const audio = document.createElement('audio');
             audio.srcObject = stream;
             audio.autoplay = true;
-            audio.muted = true; // Mute the default output
+            audio.muted = true; // Completely mute browser output
             
-            // Create Web Audio API nodes
+            // Create Web Audio API nodes for UnityInput routing
             const source = this.audioContext.createMediaStreamSource(stream);
             const gainNode = this.audioContext.createGain();
             
-            // Create channel merger for discrete channel routing
-            const channelMerger = this.audioContext.createChannelMerger(16);
-            
-            // Start with stereo panning for now (fallback if multi-channel doesn't work)
-            const pannerNode = this.audioContext.createStereoPanner();
-            
-            // Assign initial channel (will be adjustable via UI)
+            // Assign to specific channel (0-15 for 16 channels)
             const assignedChannel = this.channelIndex % 16;
             
-            // Connect for both stereo panning AND discrete channel routing
+            // Connect directly to the channel merger for UnityInput
             source.connect(gainNode);
-            
-            // Stereo panning connection (always works)
-            gainNode.connect(pannerNode);
-            pannerNode.connect(this.masterGain);
-            
-            // Try discrete channel routing (may not work in all browsers/setups)
-            try {
-                // Connect to specific channel of the merger
-                gainNode.connect(channelMerger, 0, assignedChannel);
-                channelMerger.connect(this.audioContext.destination);
-            } catch (channelError) {
-                this.logMessage(`Discrete channel routing not available, using stereo panning`, 'info');
-            }
+            gainNode.connect(this.channelMerger, 0, assignedChannel);
             
             // Store channel info
             this.audioChannels.set(userId, {
                 audio: audio,
                 source: source,
                 gainNode: gainNode,
-                pannerNode: pannerNode,
-                channelMerger: channelMerger,
                 username: username,
                 channelIndex: this.channelIndex,
                 assignedChannel: assignedChannel,
@@ -571,18 +578,41 @@ class VoiceCallApp {
             this.createChannelControlUI(userId, username, this.channelIndex, assignedChannel);
             this.channelIndex++;
             
-            this.logMessage(`${username} assigned to channel ${assignedChannel + 1} (pan: ${this.calculatePanPosition(assignedChannel)})`, 'info');
+            this.logMessage(`${username} assigned to UnityInput channel ${assignedChannel + 1}`, 'info');
+            
+            // Update the output device routing
+            this.updateUnityInputOutput();
             
         } catch (error) {
-            this.logMessage(`Error setting up channel separation for ${username}: ${error.message}`, 'error');
+            this.logMessage(`Error setting up UnityInput channel for ${username}: ${error.message}`, 'error');
             // Fallback to normal audio
             this.playRemoteAudio(userId, username, stream);
         }
     }
 
-    calculatePanPosition(channelIndex) {
-        // Spread channels across stereo field
-        return Math.min(1, Math.max(-1, (channelIndex / 8) - 1));
+    async updateUnityInputOutput() {
+        try {
+            // Create a new audio element for output to UnityInput
+            if (!this.unityOutputAudio) {
+                this.unityOutputAudio = document.createElement('audio');
+                this.unityOutputAudio.autoplay = true;
+                this.unityOutputAudio.muted = false;
+                document.body.appendChild(this.unityOutputAudio);
+            }
+            
+            // Route the processed stream to UnityInput device
+            this.unityOutputAudio.srcObject = this.mediaStreamDestination.stream;
+            
+            // Try to set the output device to UnityInput
+            const outputDeviceSelect = document.getElementById('outputDeviceSelect');
+            if (outputDeviceSelect.value && this.unityOutputAudio.setSinkId) {
+                await this.unityOutputAudio.setSinkId(outputDeviceSelect.value);
+                this.logMessage('Audio routed to selected output device', 'success');
+            }
+            
+        } catch (error) {
+            this.logMessage(`Error routing to output device: ${error.message}`, 'error');
+        }
     }
 
     createChannelControlUI(userId, username, channelIndex, assignedChannel) {
@@ -593,20 +623,16 @@ class VoiceCallApp {
         channelDiv.innerHTML = `
             <div class="channel-info">
                 <div class="channel-name">${username}</div>
-                <div class="channel-status">Channel ${assignedChannel + 1} | Pan: ${this.calculatePanPosition(assignedChannel).toFixed(2)}</div>
+                <div class="channel-status">UnityInput Channel ${assignedChannel + 1}</div>
             </div>
             <div class="channel-controls">
                 <label>Channel:</label>
-                <select class="channel-select" id="channel-${userId}-select" title="Output Channel">
+                <select class="channel-select" id="channel-${userId}-select" title="UnityInput Channel">
                     ${this.generateChannelOptions(assignedChannel)}
                 </select>
                 <label>Volume:</label>
                 <input type="range" class="volume-control" min="0" max="2" step="0.1" value="1" 
                        id="volume-${userId}" title="Volume (0-200%)">
-                <label>Pan:</label>
-                <input type="range" class="pan-control" min="-1" max="1" step="0.1" 
-                       value="${this.calculatePanPosition(assignedChannel)}" 
-                       id="pan-${userId}" title="Stereo Pan">
                 <button class="mute-channel-btn" id="mute-${userId}">🔊</button>
                 <button class="solo-channel-btn" id="solo-${userId}">Solo</button>
             </div>
@@ -619,10 +645,6 @@ class VoiceCallApp {
             this.updateChannelVolume(userId, e.target.value);
         });
         
-        document.getElementById(`pan-${userId}`).addEventListener('input', (e) => {
-            this.updateChannelPan(userId, e.target.value);
-        });
-        
         document.getElementById(`mute-${userId}`).addEventListener('click', () => {
             this.toggleChannelMute(userId);
         });
@@ -632,7 +654,7 @@ class VoiceCallApp {
         });
         
         document.getElementById(`channel-${userId}-select`).addEventListener('change', (e) => {
-            this.reassignChannel(userId, parseInt(e.target.value));
+            this.reassignUnityChannel(userId, parseInt(e.target.value));
         });
     }
 
@@ -645,43 +667,24 @@ class VoiceCallApp {
         return options;
     }
 
-    reassignChannel(userId, newChannel) {
+    reassignUnityChannel(userId, newChannel) {
         const channel = this.audioChannels.get(userId);
-        if (channel && channel.source) {
+        if (channel && channel.source && channel.gainNode) {
             try {
-                // Update the assigned channel
+                // Disconnect from old channel
+                channel.gainNode.disconnect(this.channelMerger);
+                
+                // Connect to new channel
+                channel.gainNode.connect(this.channelMerger, 0, newChannel);
+                
+                // Update stored info
                 channel.assignedChannel = newChannel;
                 
-                // Disconnect old routing
-                if (channel.channelMerger) {
-                    channel.gainNode.disconnect(channel.channelMerger);
-                }
-                
-                // Update pan position for stereo representation
-                const newPanPosition = this.calculatePanPosition(newChannel);
-                channel.pannerNode.pan.setValueAtTime(newPanPosition, this.audioContext.currentTime);
-                
-                // Update pan slider
-                const panSlider = document.getElementById(`pan-${userId}`);
-                if (panSlider) {
-                    panSlider.value = newPanPosition;
-                }
-                
-                // Try to create new discrete channel routing
-                try {
-                    const newChannelMerger = this.audioContext.createChannelMerger(16);
-                    channel.gainNode.connect(newChannelMerger, 0, newChannel);
-                    newChannelMerger.connect(this.audioContext.destination);
-                    channel.channelMerger = newChannelMerger;
-                } catch (error) {
-                    this.logMessage(`Discrete channel routing not available, using pan position`, 'info');
-                }
-                
                 this.updateChannelStatus(userId);
-                this.logMessage(`${channel.username} moved to channel ${newChannel + 1}`, 'info');
+                this.logMessage(`${channel.username} moved to UnityInput channel ${newChannel + 1}`, 'info');
                 
             } catch (error) {
-                this.logMessage(`Error reassigning channel: ${error.message}`, 'error');
+                this.logMessage(`Error reassigning UnityInput channel: ${error.message}`, 'error');
             }
         }
     }
@@ -731,23 +734,36 @@ class VoiceCallApp {
         }
     }
 
-    updateChannelPan(userId, panValue) {
-        const channel = this.audioChannels.get(userId);
-        if (channel && channel.pannerNode) {
-            channel.pannerNode.pan.setValueAtTime(parseFloat(panValue), this.audioContext.currentTime);
-            this.updateChannelStatus(userId);
-        }
-    }
-
     updateChannelStatus(userId) {
         const channel = this.audioChannels.get(userId);
         if (channel) {
             const statusElement = document.querySelector(`#channel-${userId} .channel-status`);
             if (statusElement) {
                 const volume = channel.gainNode.gain.value;
-                const pan = channel.pannerNode.pan.value;
                 const channelNum = channel.assignedChannel + 1;
-                statusElement.textContent = `Channel ${channelNum} | Vol: ${(volume * 100).toFixed(0)}% | Pan: ${pan.toFixed(2)}`;
+                statusElement.textContent = `UnityInput Ch ${channelNum} | Vol: ${(volume * 100).toFixed(0)}%`;
+            }
+        }
+    }
+
+    reassignUnityChannel(userId, newChannel) {
+        const channel = this.audioChannels.get(userId);
+        if (channel && channel.source && channel.gainNode) {
+            try {
+                // Disconnect from old channel
+                channel.gainNode.disconnect(this.channelMerger);
+                
+                // Connect to new channel
+                channel.gainNode.connect(this.channelMerger, 0, newChannel);
+                
+                // Update stored info
+                channel.assignedChannel = newChannel;
+                
+                this.updateChannelStatus(userId);
+                this.logMessage(`${channel.username} moved to UnityInput channel ${newChannel + 1}`, 'info');
+                
+            } catch (error) {
+                this.logMessage(`Error reassigning UnityInput channel: ${error.message}`, 'error');
             }
         }
     }

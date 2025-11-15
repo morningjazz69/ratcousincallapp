@@ -67,10 +67,16 @@ class VoiceCallApp {
             this.showAuthError(data.message);
         });
 
-        this.socket.on('existing-participants', (participants) => {
-            participants.forEach(participant => {
-                this.handleUserJoined(participant);
-            });
+        this.socket.on('existing-participants', async (participants) => {
+            for (const participant of participants) {
+                await this.createPeerConnection(participant.userId, participant.username);
+                this.addParticipant(participant);
+                
+                // As the new joiner, we initiate connections to existing participants
+                const peer = this.peers.get(participant.userId);
+                peer.isOfferer = true;
+                await this.sendOffer(participant.userId);
+            }
         });
 
         this.socket.on('user-joined', (data) => {
@@ -253,9 +259,12 @@ class VoiceCallApp {
         this.logMessage(`${participant.username} joined the call${participant.isAdmin ? ' (Admin)' : ''}`, 'info');
         this.addParticipant(participant);
 
-        // Initiate WebRTC connection if we're already in the call
-        if (this.isInCall && this.localStream) {
+        // Only create connection if we're already in the call and we're the "offerer"
+        // Use socket ID comparison to determine who initiates
+        if (this.isInCall && this.localStream && this.socket.id < participant.userId) {
             await this.createPeerConnection(participant.userId, participant.username);
+            const peer = this.peers.get(participant.userId);
+            peer.isOfferer = true;
             await this.sendOffer(participant.userId);
         }
     }
@@ -286,11 +295,22 @@ class VoiceCallApp {
         // Handle connection state changes
         peerConnection.onconnectionstatechange = () => {
             this.logMessage(`Connection with ${username}: ${peerConnection.connectionState}`, 'info');
+            if (peerConnection.connectionState === 'failed') {
+                this.logMessage(`Connection failed with ${username}, attempting restart`, 'error');
+                // Could implement reconnection logic here
+            }
+        };
+
+        // Handle ICE connection state changes
+        peerConnection.oniceconnectionstatechange = () => {
+            this.logMessage(`ICE connection with ${username}: ${peerConnection.iceConnectionState}`, 'info');
         };
 
         this.peers.set(userId, {
             connection: peerConnection,
-            username: username
+            username: username,
+            isOfferer: false,
+            iceCandidateQueue: []
         });
 
         return peerConnection;
@@ -323,14 +343,30 @@ class VoiceCallApp {
         const peer = this.peers.get(senderId);
         
         try {
-            await peer.connection.setRemoteDescription(offer);
-            const answer = await peer.connection.createAnswer();
-            await peer.connection.setLocalDescription(answer);
-            
-            this.socket.emit('webrtc-answer', {
-                targetId: senderId,
-                answer: answer
-            });
+            // Only set remote description if we're in the correct state
+            if (peer.connection.signalingState === 'stable' || peer.connection.signalingState === 'have-remote-offer') {
+                await peer.connection.setRemoteDescription(offer);
+                
+                // Process any queued ICE candidates
+                for (const candidate of peer.iceCandidateQueue) {
+                    try {
+                        await peer.connection.addIceCandidate(candidate);
+                    } catch (error) {
+                        this.logMessage(`Error adding queued ICE candidate: ${error.message}`, 'error');
+                    }
+                }
+                peer.iceCandidateQueue = [];
+                
+                const answer = await peer.connection.createAnswer();
+                await peer.connection.setLocalDescription(answer);
+                
+                this.socket.emit('webrtc-answer', {
+                    targetId: senderId,
+                    answer: answer
+                });
+            } else {
+                this.logMessage(`Cannot handle offer from ${senderUsername} - wrong signaling state: ${peer.connection.signalingState}`, 'error');
+            }
         } catch (error) {
             this.logMessage(`Error handling offer from ${senderUsername}: ${error.message}`, 'error');
         }
@@ -342,7 +378,22 @@ class VoiceCallApp {
         
         if (peer) {
             try {
-                await peer.connection.setRemoteDescription(answer);
+                // Only set remote description if we're in the correct state
+                if (peer.connection.signalingState === 'have-local-offer') {
+                    await peer.connection.setRemoteDescription(answer);
+                    
+                    // Process any queued ICE candidates
+                    for (const candidate of peer.iceCandidateQueue) {
+                        try {
+                            await peer.connection.addIceCandidate(candidate);
+                        } catch (error) {
+                            this.logMessage(`Error adding queued ICE candidate: ${error.message}`, 'error');
+                        }
+                    }
+                    peer.iceCandidateQueue = [];
+                } else {
+                    this.logMessage(`Cannot handle answer from ${peer.username} - wrong signaling state: ${peer.connection.signalingState}`, 'error');
+                }
             } catch (error) {
                 this.logMessage(`Error handling answer from ${peer.username}: ${error.message}`, 'error');
             }
@@ -355,7 +406,14 @@ class VoiceCallApp {
         
         if (peer) {
             try {
-                await peer.connection.addIceCandidate(candidate);
+                // Only add ICE candidate if remote description is set
+                if (peer.connection.remoteDescription) {
+                    await peer.connection.addIceCandidate(candidate);
+                } else {
+                    // Queue the candidate for later
+                    peer.iceCandidateQueue.push(candidate);
+                    this.logMessage(`Queued ICE candidate from ${peer.username}`, 'info');
+                }
             } catch (error) {
                 this.logMessage(`Error adding ICE candidate from ${peer.username}: ${error.message}`, 'error');
             }
